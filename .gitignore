@@ -1,0 +1,62 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+*.log
+logs/
+
+# Data files (large)
+data/Mendeley_data/
+data/*.zip
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Outputs
+outputs/
+
+# Claude
+.claude/
+CLAUDE.md
+
+# Project plan
+notebooks/PROJECT_PLAN.md
+
+# MATLAB reference code
+IndPenSim_V2.02_matlab/
+
+# Notebook data duplicates
+notebooks/100_batches.zip
+notebooks/Mendeley_data/
