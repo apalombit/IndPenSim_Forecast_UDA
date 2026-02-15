@@ -5,6 +5,9 @@ from pathlib import Path
 
 import pandas as pd
 
+# Project root directory
+PROJECT_ROOT = Path(__file__).parent.parent
+
 # Column name mappings for cleaner access
 COLUMN_MAP = {
     "Time (h)": "time",
@@ -43,16 +46,19 @@ COLUMN_MAP = {
     "Batch reference(Batch_ref:Batch ref)": "batch_id",
 }
 
-# Default data paths
-DEFAULT_ZIP_PATH = Path("data/100_Batches_IndPenSim.zip")
-DEFAULT_CSV_PATH = Path("data/Mendeley_data/100_Batches_IndPenSim_V3.csv")
-DEFAULT_STATS_PATH = Path("data/Mendeley_data/100_Batches_IndPenSim_Statistics.csv")
+# Default data paths (relative to project root)
+DEFAULT_ZIP_PATH = PROJECT_ROOT / "data/100_Batches_IndPenSim.zip"
+DEFAULT_CSV_PATH = PROJECT_ROOT / "data/Mendeley_data/100_Batches_IndPenSim_V3.csv"
+DEFAULT_STATS_PATH = PROJECT_ROOT / "data/Mendeley_data/100_Batches_IndPenSim_Statistics.csv"
 
 
-def extract_data(zip_path: Path | str = DEFAULT_ZIP_PATH, extract_to: Path | str = Path("data")) -> None:
+def extract_data(zip_path: Path | str = DEFAULT_ZIP_PATH, extract_to: Path | str | None = None) -> None:
     """Extract IndPenSim data from zip archive."""
     zip_path = Path(zip_path)
-    extract_to = Path(extract_to)
+    if extract_to is None:
+        extract_to = PROJECT_ROOT / "data"
+    else:
+        extract_to = Path(extract_to)
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(extract_to)
 
@@ -136,6 +142,7 @@ def get_batch_info(batches: dict[int, pd.DataFrame]) -> pd.DataFrame:
         duration = df["time"].max() - df["time"].min()
         control_ref = df["control_ref"].iloc[0] if "control_ref" in df.columns else None
         is_fault = df["fault_ref"].max() > 0 if "fault_ref" in df.columns else False
+        p_conc = df["P"].values[-1] if "P" in df.columns else 0.0
 
         # Determine control mode based on batch_id
         if batch_id <= 30:
@@ -153,6 +160,7 @@ def get_batch_info(batches: dict[int, pd.DataFrame]) -> pd.DataFrame:
             "duration_h": duration,
             "control_mode": control_mode,
             "is_fault": is_fault,
+            "p_conc": p_conc
         })
 
     return pd.DataFrame(info).sort_values("batch_id").reset_index(drop=True)

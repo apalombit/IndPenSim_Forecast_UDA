@@ -5,6 +5,7 @@ import pytest
 
 from src.data_loader import (
     COLUMN_MAP,
+    DEFAULT_CSV_PATH,
     get_batch_info,
     get_final_penicillin,
     load_batches,
@@ -12,8 +13,8 @@ from src.data_loader import (
     load_statistics,
 )
 
-# Skip tests if data not available
-DATA_PATH = "data/Mendeley_data/100_Batches_IndPenSim_V3.csv"
+# Use default path from data_loader
+DATA_PATH = DEFAULT_CSV_PATH
 
 
 @pytest.fixture(scope="module")
