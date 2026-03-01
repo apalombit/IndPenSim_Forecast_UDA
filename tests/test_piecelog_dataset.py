@@ -154,6 +154,164 @@ class TestAugmentation:
         np.testing.assert_array_equal(ds.fitted_params[bid], original)
 
 
+class TestTCutoff:
+    def test_t_cutoff_present_in_sample(self, synth):
+        ds = _make_dataset(synth, augment=False)
+        sample = ds[0]
+        assert "t_cutoff" in sample
+
+    def test_t_cutoff_less_than_t_predict(self, synth):
+        ds = _make_dataset(synth, augment=False)
+        for i in range(len(ds)):
+            sample = ds[i]
+            assert sample["t_cutoff"].item() < sample["t_predict"].item()
+
+    def test_t_cutoff_positive(self, synth):
+        ds = _make_dataset(synth, augment=False)
+        for i in range(len(ds)):
+            sample = ds[i]
+            assert sample["t_cutoff"].item() > 0.0
+
+    def test_t_cutoff_in_collated_batch(self, synth):
+        from src.piecelog_dataset import piecelog_collate_fn
+        ds = _make_dataset(synth, augment=False)
+        batch = piecelog_collate_fn([ds[i] for i in range(min(4, len(ds)))])
+        assert "t_cutoff" in batch
+        assert batch["t_cutoff"].shape[0] == min(4, len(ds))
+
+
+class TestFullBatch:
+    def test_one_sample_per_batch(self, synth):
+        ds = PieceLogDataset(
+            batch_ids=synth["batch_ids"],
+            fitted_params_df=synth["fitted_params_df"],
+            batches=synth["batches"],
+            stats=synth["stats"],
+            features=synth["features"],
+            max_seq_len=200,
+            samples_per_batch=5,  # should be ignored
+            seed=0,
+            full_batch=True,
+        )
+        # One sample per batch that has fitted params
+        n_batches_with_params = sum(
+            1 for bid in synth["batch_ids"] if bid in ds.fitted_params
+        )
+        assert len(ds) == n_batches_with_params
+
+    def test_T_idx_equals_n_steps(self, synth):
+        ds = PieceLogDataset(
+            batch_ids=synth["batch_ids"],
+            fitted_params_df=synth["fitted_params_df"],
+            batches=synth["batches"],
+            stats=synth["stats"],
+            features=synth["features"],
+            max_seq_len=200,
+            seed=0,
+            full_batch=True,
+        )
+        for sample_meta in ds.samples:
+            bid = sample_meta["batch_id"]
+            n_steps = len(synth["batches"][bid])
+            assert sample_meta["T_idx"] == n_steps
+            assert sample_meta["D_steps"] == 0
+
+    def test_t_cutoff_equals_t_predict(self, synth):
+        ds = PieceLogDataset(
+            batch_ids=synth["batch_ids"],
+            fitted_params_df=synth["fitted_params_df"],
+            batches=synth["batches"],
+            stats=synth["stats"],
+            features=synth["features"],
+            max_seq_len=200,
+            seed=0,
+            full_batch=True,
+        )
+        for i in range(len(ds)):
+            sample = ds[i]
+            assert sample["t_cutoff"].item() == pytest.approx(
+                sample["t_predict"].item(), rel=1e-5
+            )
+
+    def test_t_cutoff_is_last_timestamp(self, synth):
+        ds = PieceLogDataset(
+            batch_ids=synth["batch_ids"],
+            fitted_params_df=synth["fitted_params_df"],
+            batches=synth["batches"],
+            stats=synth["stats"],
+            features=synth["features"],
+            max_seq_len=200,
+            seed=0,
+            full_batch=True,
+        )
+        for i in range(len(ds)):
+            bid = ds.samples[i]["batch_id"]
+            last_t = float(synth["batches"][bid]["time"].values[-1])
+            assert ds[i]["t_cutoff"].item() == pytest.approx(last_t, rel=1e-5)
+
+    def test_t_cutoff_gte_t_break(self, synth):
+        """Full-batch t_cutoff should be >= t_break for all batches."""
+        ds = PieceLogDataset(
+            batch_ids=synth["batch_ids"],
+            fitted_params_df=synth["fitted_params_df"],
+            batches=synth["batches"],
+            stats=synth["stats"],
+            features=synth["features"],
+            max_seq_len=200,
+            seed=0,
+            full_batch=True,
+        )
+        t_break_lookup = synth["fitted_params_df"].set_index("batch_id")["t_break"]
+        for i in range(len(ds)):
+            bid = ds.samples[i]["batch_id"]
+            t_cutoff = ds[i]["t_cutoff"].item()
+            t_break = float(t_break_lookup[bid])
+            assert t_cutoff >= t_break, (
+                f"Batch {bid}: t_cutoff={t_cutoff:.1f} < t_break={t_break:.1f}"
+            )
+
+    def test_x_shape_is_max_seq_len(self, synth):
+        ds = PieceLogDataset(
+            batch_ids=synth["batch_ids"],
+            fitted_params_df=synth["fitted_params_df"],
+            batches=synth["batches"],
+            stats=synth["stats"],
+            features=synth["features"],
+            max_seq_len=150,
+            seed=0,
+            full_batch=True,
+        )
+        for i in range(len(ds)):
+            x = ds[i]["x"]
+            assert x.shape[0] == 150
+
+    def test_create_dataloaders_full_batch(self, synth):
+        loaders = create_piecelog_dataloaders(
+            source_ids=synth["batch_ids"][:3],
+            target_ids=synth["batch_ids"][3:],
+            fitted_params_df=synth["fitted_params_df"],
+            batches=synth["batches"],
+            features=synth["features"],
+            max_seq_len=200,
+            samples_per_batch=5,  # should be ignored
+            full_batch=True,
+        )
+        train_ds = loaders["train_dataset"]
+        val_ds = loaders["val_dataset"]
+        target_ds = loaders["target_dataset"]
+        # Each sample should have T_idx == n_steps
+        for meta in train_ds.samples:
+            n_steps = len(synth["batches"][meta["batch_id"]])
+            assert meta["T_idx"] == n_steps
+            assert meta["D_steps"] == 0
+        for meta in val_ds.samples:
+            n_steps = len(synth["batches"][meta["batch_id"]])
+            assert meta["T_idx"] == n_steps
+        for meta in target_ds.samples:
+            n_steps = len(synth["batches"][meta["batch_id"]])
+            assert meta["T_idx"] == n_steps
+
+
 class TestCreateDataloadersAugment:
     def test_augment_only_on_train(self, synth):
         loaders = create_piecelog_dataloaders(

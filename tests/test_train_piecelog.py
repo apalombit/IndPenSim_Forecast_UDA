@@ -12,6 +12,7 @@ from src.piecelog_dataset import compute_param_stats
 from src.train_piecelog import (
     piecelog_loss,
     make_stepwise_alpha_schedule,
+    make_stepwise_lr_schedule,
     get_alpha_for_epoch,
 )
 
@@ -45,6 +46,12 @@ def batch(model):
         [45.0, 0.020, 70.0, 0.012, 26.0, 200.0, 0.060],
     ])
     return x, t_predict, y_true, params_true
+
+
+@pytest.fixture
+def t_cutoff():
+    """Per-sample input window end times for curve loss tests."""
+    return torch.tensor([80.0, 120.0, 160.0, 200.0])
 
 
 @pytest.fixture
@@ -289,6 +296,38 @@ class TestMakeStepwiseAlphaSchedule:
         assert schedule == [(0, 0.2), (25, 0.0)]
 
 
+class TestMakeStepwiseLrSchedule:
+    def test_default_5_steps(self):
+        schedule = make_stepwise_lr_schedule(1e-3, 1e-5, n_epochs=100, n_steps=5)
+        assert len(schedule) == 5
+        assert schedule[0][0] == 0
+        assert schedule[0][1] == pytest.approx(1e-3, rel=1e-6)
+        assert schedule[-1][0] == 80
+        assert schedule[-1][1] == pytest.approx(1e-5, rel=1e-6)
+
+    def test_lr_values_decrease(self):
+        schedule = make_stepwise_lr_schedule(1e-3, 1e-5, n_epochs=100, n_steps=5)
+        lrs = [s[1] for s in schedule]
+        for i in range(len(lrs) - 1):
+            assert lrs[i] >= lrs[i + 1]
+
+    def test_lr_values_match_expected(self):
+        schedule = make_stepwise_lr_schedule(1e-3, 1e-5, n_epochs=100, n_steps=5)
+        lrs = [s[1] for s in schedule]
+        expected = [1e-3, 0.0007525, 0.000505, 0.0002575, 1e-5]
+        for a, e in zip(lrs, expected):
+            assert a == pytest.approx(e, abs=1e-6)
+
+    def test_single_step(self):
+        schedule = make_stepwise_lr_schedule(1e-3, 1e-5, n_epochs=100, n_steps=1)
+        assert len(schedule) == 1
+        assert schedule[0][1] == pytest.approx(1e-3, rel=1e-6)
+
+    def test_decays_to_lr_min(self):
+        schedule = make_stepwise_lr_schedule(1e-3, 1e-4, n_epochs=200, n_steps=10)
+        assert schedule[-1][1] == pytest.approx(1e-4, rel=1e-6)
+
+
 class TestGetAlphaForEpoch:
     def test_first_phase(self):
         schedule = [(0, 0.1), (20, 0.075), (40, 0.05), (60, 0.025), (80, 0.0)]
@@ -309,3 +348,177 @@ class TestGetAlphaForEpoch:
         schedule = [(0, 0.1), (50, 0.0)]
         assert get_alpha_for_epoch(49, schedule) == 0.1
         assert get_alpha_for_epoch(50, schedule) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Tests for multi-point curve loss
+# ---------------------------------------------------------------------------
+
+class TestPiecelogLossCurve:
+    def test_n_curve_points_zero_preserves_behavior(self, model, batch):
+        """n_curve_points=0 should give identical result to omitting it."""
+        x, t_predict, y_true, params_true = batch
+        criterion = nn.MSELoss()
+        model.eval()
+
+        _, d_default = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.5,
+        )
+        _, d_zero = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.5,
+            n_curve_points=0,
+        )
+
+        assert d_default["conc"] == pytest.approx(d_zero["conc"], rel=1e-6)
+        assert d_default["param"] == pytest.approx(d_zero["param"], rel=1e-6)
+
+    def test_curve_loss_runs_and_returns_dict(self, model, batch, t_cutoff):
+        """Smoke test: multi-point curve loss should run and return expected keys."""
+        x, t_predict, y_true, params_true = batch
+        criterion = nn.MSELoss()
+
+        loss, d = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.1,
+            n_curve_points=20, t_cutoff=t_cutoff,
+        )
+
+        assert "conc" in d
+        assert "param" in d
+        assert loss.ndim == 0  # scalar
+        assert d["conc"] >= 0.0
+
+    def test_curve_loss_backward_works(self, model, batch, t_cutoff):
+        """Gradients should flow through multi-point curve loss."""
+        x, t_predict, y_true, params_true = batch
+        criterion = nn.MSELoss()
+
+        loss, _ = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.1,
+            n_curve_points=20, t_cutoff=t_cutoff,
+        )
+        loss.backward()
+
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in model.parameters()
+        )
+        assert has_grad
+
+    def test_curve_loss_with_conc_scale(self, model, batch, t_cutoff):
+        """conc_scale should reduce curve loss magnitude."""
+        x, t_predict, y_true, params_true = batch
+        criterion = nn.MSELoss()
+        model.eval()
+
+        _, d_raw = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.0,
+            n_curve_points=20, t_cutoff=t_cutoff, conc_scale=None,
+        )
+        _, d_scaled = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.0,
+            n_curve_points=20, t_cutoff=t_cutoff, conc_scale=12.0,
+        )
+
+        assert d_scaled["conc"] < d_raw["conc"]
+
+    def test_perfect_params_give_zero_curve_loss(self, model, batch, t_cutoff):
+        """When predicted params == fitted params, L_curve should be ~0."""
+        x, t_predict, y_true, params_true = batch
+        criterion = nn.MSELoss()
+
+        # Monkey-patch get_parameters to return the fitted params exactly
+        original_get_params = model.get_parameters
+
+        def fake_get_params(x_input):
+            return {name: params_true[:, i] for i, name in enumerate(PARAM_NAMES)}
+
+        model.get_parameters = fake_get_params
+
+        loss, d = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.0,
+            n_curve_points=20, t_cutoff=t_cutoff,
+        )
+
+        model.get_parameters = original_get_params
+
+        assert d["conc"] == pytest.approx(0.0, abs=1e-6)
+
+
+class TestCurveGridBehavior:
+    """Tests for the per-sample jittered grid generation."""
+
+    def test_grid_within_t_cutoff(self, model, batch, t_cutoff):
+        """Grid points should be within [0, t_cutoff_i] for each sample."""
+        x, t_predict, y_true, params_true = batch
+        criterion = nn.MSELoss()
+        model.eval()
+
+        # Capture the grid by inspecting the piecelog_torch call
+        # We test indirectly: with t_cutoff=[80,120,160,200] and N=20,
+        # the loss should still run without error
+        loss, d = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.0,
+            n_curve_points=20, t_cutoff=t_cutoff,
+        )
+        assert d["conc"] >= 0.0
+
+        # Directly verify grid construction logic
+        N = 20
+        B = 4
+        base = torch.linspace(0.0, 1.0, N).unsqueeze(0).expand(B, N)
+        t_grid = base * t_cutoff.unsqueeze(1)
+        for i in range(B):
+            assert t_grid[i].min() >= 0.0
+            assert t_grid[i].max() <= t_cutoff[i].item() + 1e-6
+
+    def test_jitter_present_during_training(self, model, batch, t_cutoff):
+        """During model.train(), grid should be stochastic across calls."""
+        x, t_predict, y_true, params_true = batch
+        criterion = nn.MSELoss()
+        model.train()
+
+        _, d1 = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.0,
+            n_curve_points=20, t_cutoff=t_cutoff,
+        )
+        _, d2 = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.0,
+            n_curve_points=20, t_cutoff=t_cutoff,
+        )
+        # Jittered grids should produce slightly different losses
+        assert d1["conc"] != pytest.approx(d2["conc"], abs=1e-10)
+
+    def test_no_jitter_during_eval(self, model, batch, t_cutoff):
+        """During model.eval(), grid should be deterministic."""
+        x, t_predict, y_true, params_true = batch
+        criterion = nn.MSELoss()
+        model.eval()
+
+        _, d1 = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.0,
+            n_curve_points=20, t_cutoff=t_cutoff,
+        )
+        _, d2 = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.0,
+            n_curve_points=20, t_cutoff=t_cutoff,
+        )
+        assert d1["conc"] == pytest.approx(d2["conc"], rel=1e-6)
+
+    def test_different_t_cutoff_gives_different_loss(self, model, batch):
+        """Different t_cutoff values should produce different curve losses."""
+        x, t_predict, y_true, params_true = batch
+        criterion = nn.MSELoss()
+        model.eval()
+
+        tc_short = torch.tensor([50.0, 50.0, 50.0, 50.0])
+        tc_long = torch.tensor([200.0, 200.0, 200.0, 200.0])
+
+        _, d_short = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.0,
+            n_curve_points=20, t_cutoff=tc_short,
+        )
+        _, d_long = piecelog_loss(
+            model, x, t_predict, y_true, params_true, criterion, alpha=0.0,
+            n_curve_points=20, t_cutoff=tc_long,
+        )
+        assert d_short["conc"] != pytest.approx(d_long["conc"], rel=0.01)

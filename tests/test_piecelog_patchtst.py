@@ -74,7 +74,7 @@ class TestConstrainedParameterHead:
         head = ConstrainedParameterHead(d_model=32, T_max=T_max)
         features = torch.randn(100, 32)
         params = head(features)
-        assert (params["t_break"] >= 0.5 * T_max - 1e-4).all()
+        assert (params["t_break"] >= 0).all()
         assert (params["t_break"] <= T_max + 1e-4).all()
 
     def test_gradient_flow(self):
@@ -148,7 +148,13 @@ class TestPieceLogPatchTST:
     def test_different_t_predict_different_output(self):
         """Different prediction times should produce different outputs."""
         torch.manual_seed(0)
-        model = PieceLogPatchTST(n_features=28, seq_len=200, d_model=32)
+        model = PieceLogPatchTST(n_features=28, seq_len=200, d_model=32, T_max=400.0)
+        # Initialize to mean-like params so outputs are non-trivially different
+        mock_df = pd.DataFrame([{
+            "K": 37.0, "r": 0.021, "t0": 50.0, "lam": 0.023,
+            "t_lag": 25.8, "t_break": 200.0, "slope": 0.048,
+        }])
+        initialize_param_head(model, mock_df)
         model.eval()
         x = torch.randn(1, 200, 28)
 

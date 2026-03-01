@@ -9,7 +9,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-from .piecelog_model import PARAM_NAMES
+from .piecelog_model import PARAM_NAMES, piecelog_torch
 from .train import EarlyStopping
 
 
@@ -39,6 +39,37 @@ def make_stepwise_alpha_schedule(
         epoch = i * step_size
         alpha = alpha_max * (1.0 - i / (n_steps - 1)) if n_steps > 1 else alpha_max
         schedule.append((epoch, round(alpha, 6)))
+    return schedule
+
+
+def make_stepwise_lr_schedule(
+    lr_max: float,
+    lr_min: float,
+    n_epochs: int,
+    n_steps: int = 5,
+) -> list[tuple[int, float]]:
+    """Create a stepwise decaying learning rate schedule.
+
+    LR decreases in equal steps from lr_max to lr_min over n_epochs.
+
+    Example with lr_max=1e-3, lr_min=1e-5, n_epochs=100, n_steps=5:
+        [(0, 0.001), (20, 0.000755), (40, 0.00051), (60, 0.000265), (80, 1e-05)]
+
+    Args:
+        lr_max: Starting learning rate.
+        lr_min: Final learning rate.
+        n_epochs: Total training epochs.
+        n_steps: Number of constant-LR phases.
+
+    Returns:
+        List of (epoch, lr) pairs sorted by epoch.
+    """
+    step_size = n_epochs // n_steps
+    schedule = []
+    for i in range(n_steps):
+        epoch = i * step_size
+        lr = lr_max - (lr_max - lr_min) * i / (n_steps - 1) if n_steps > 1 else lr_max
+        schedule.append((epoch, round(lr, 10)))
     return schedule
 
 
@@ -74,8 +105,16 @@ def piecelog_loss(
     alpha: float = 0.1,
     param_stats: dict | None = None,
     conc_scale: float | None = None,
+    n_curve_points: int = 0,
+    t_cutoff: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Combined loss: concentration MSE + alpha * parameter MSE.
+
+    When ``n_curve_points > 0``, the single-point concentration loss is
+    replaced by a multi-point curve loss that evaluates the predicted
+    piece-log curve at N points in [0, t_cutoff] and compares against
+    the curve defined by the pre-fitted parameters. During training the
+    grid is stratified-jittered; during eval it is deterministic.
 
     Args:
         model: PieceLogPatchTST model.
@@ -91,17 +130,62 @@ def piecelog_loss(
             both P_pred and y_true are divided by conc_scale before computing
             L_conc, bringing it to ~O(0.1) comparable to normalized L_param.
             Scale-only (no mean shift) since concentrations are non-negative.
+        n_curve_points: Number of time points for multi-point curve loss.
+            0 (default) keeps the old single-point behavior.
+        t_cutoff: Per-sample input window end time, shape (B,). Required
+            when n_curve_points > 0.
 
     Returns:
         Tuple of (total_loss, loss_dict) where loss_dict has 'conc' and 'param'.
     """
     params_pred = model.get_parameters(x)
-    P_pred = model(x, t_predict)
 
-    if conc_scale is not None:
-        L_conc = criterion(P_pred / conc_scale, y_true / conc_scale)
+    if n_curve_points > 0:
+        B = x.shape[0]
+        N = n_curve_points
+        # Per-sample jittered grid in [0, t_cutoff]
+        base = torch.linspace(0.0, 1.0, N, device=x.device).unsqueeze(0).expand(B, N)
+        if model.training:
+            spacing = 1.0 / (N - 1) if N > 1 else 0.0
+            jitter = (torch.rand(B, N, device=x.device) - 0.5) * spacing
+            grid_01 = (base + jitter).clamp(0.0, 1.0)
+        else:
+            grid_01 = base
+        t_grid = grid_01 * t_cutoff.unsqueeze(1)   # (B, N)
+        t_flat = t_grid.reshape(B * N)              # (B*N,)
+
+        # Expand predicted params: each (B,) -> (B, N) -> (B*N,)
+        def _expand(p):
+            return p.unsqueeze(1).expand(B, N).reshape(B * N)
+
+        P_pred_flat = piecelog_torch(
+            t_flat,
+            _expand(params_pred["K"]), _expand(params_pred["r"]),
+            _expand(params_pred["t0"]), _expand(params_pred["lam"]),
+            _expand(params_pred["t_lag"]), _expand(params_pred["t_break"]),
+            _expand(params_pred["slope"]),
+        )
+
+        # Ground truth from fitted params (detached)
+        K_t, r_t, t0_t, lam_t, tlag_t, tbreak_t, slope_t = [
+            params_true[:, i].detach() for i in range(7)
+        ]
+        P_true_flat = piecelog_torch(
+            t_flat,
+            _expand(K_t), _expand(r_t), _expand(t0_t), _expand(lam_t),
+            _expand(tlag_t), _expand(tbreak_t), _expand(slope_t),
+        )
+
+        if conc_scale is not None:
+            L_conc = criterion(P_pred_flat / conc_scale, P_true_flat / conc_scale)
+        else:
+            L_conc = criterion(P_pred_flat, P_true_flat)
     else:
-        L_conc = criterion(P_pred, y_true)
+        P_pred = model(x, t_predict)
+        if conc_scale is not None:
+            L_conc = criterion(P_pred / conc_scale, y_true / conc_scale)
+        else:
+            L_conc = criterion(P_pred, y_true)
 
     L_param = torch.tensor(0.0, device=x.device)
     if alpha > 0:
@@ -130,6 +214,7 @@ def train_epoch_piecelog(
     alpha: float = 0.1,
     param_stats: dict | None = None,
     conc_scale: float | None = None,
+    n_curve_points: int = 0,
 ) -> dict:
     """Train one epoch with dual loss.
 
@@ -142,6 +227,7 @@ def train_epoch_piecelog(
         alpha: Parameter loss weight.
         param_stats: Per-parameter z-score stats for normalized param loss.
         conc_scale: Concentration std for normalizing L_conc.
+        n_curve_points: Number of time points for multi-point curve loss.
 
     Returns:
         Dict with total_loss, conc_loss, param_loss averages.
@@ -157,11 +243,13 @@ def train_epoch_piecelog(
         t_predict = batch["t_predict"].to(device)
         y_conc = batch["y_conc"].to(device)
         params_fitted = batch["params_fitted"].to(device)
+        t_cutoff = batch["t_cutoff"].to(device) if n_curve_points > 0 else None
 
         optimizer.zero_grad()
         loss, loss_dict = piecelog_loss(
             model, x, t_predict, y_conc, params_fitted, criterion, alpha,
             param_stats=param_stats, conc_scale=conc_scale,
+            n_curve_points=n_curve_points, t_cutoff=t_cutoff,
         )
         loss.backward()
         optimizer.step()
@@ -186,6 +274,7 @@ def evaluate_piecelog(
     alpha: float = 0.1,
     param_stats: dict | None = None,
     conc_scale: float | None = None,
+    n_curve_points: int = 0,
 ) -> dict:
     """Evaluate PieceLog-PatchTST on a data split.
 
@@ -197,6 +286,7 @@ def evaluate_piecelog(
         alpha: Parameter loss weight.
         param_stats: Per-parameter z-score stats for normalized param loss.
         conc_scale: Concentration std for normalizing L_conc.
+        n_curve_points: Number of time points for multi-point curve loss.
 
     Returns:
         Dict with loss, conc_loss, param_loss, mae, rmse, predictions, targets.
@@ -215,10 +305,12 @@ def evaluate_piecelog(
             t_predict = batch["t_predict"].to(device)
             y_conc = batch["y_conc"].to(device)
             params_fitted = batch["params_fitted"].to(device)
+            t_cutoff = batch["t_cutoff"].to(device) if n_curve_points > 0 else None
 
             loss, loss_dict = piecelog_loss(
                 model, x, t_predict, y_conc, params_fitted, criterion, alpha,
                 param_stats=param_stats, conc_scale=conc_scale,
+                n_curve_points=n_curve_points, t_cutoff=t_cutoff,
             )
 
             total_loss += loss.item()
@@ -226,6 +318,7 @@ def evaluate_piecelog(
             total_param += loss_dict["param"]
             n_batches += 1
 
+            # MAE/RMSE metrics still use single-point model(x, t_predict) vs y_conc
             P_pred = model(x, t_predict)
             all_preds.append(P_pred.cpu().numpy())
             all_targets.append(y_conc.cpu().numpy())
@@ -263,6 +356,8 @@ def train_and_evaluate_piecelog(
     verbose: bool = True,
     param_stats: dict | None = None,
     conc_scale: float | None = None,
+    lr_schedule: list[tuple[int, float]] | None = None,
+    n_curve_points: int = 0,
 ) -> dict:
     """Train PieceLog-PatchTST and evaluate on all splits.
 
@@ -272,7 +367,7 @@ def train_and_evaluate_piecelog(
         val_loader: Validation DataLoader.
         target_loader: Target domain DataLoader.
         n_epochs: Maximum epochs.
-        lr: Learning rate.
+        lr: Learning rate (used when lr_schedule is None).
         weight_decay: AdamW weight decay.
         patience: Early stopping patience.
         alpha: Fixed parameter loss weight (used when alpha_schedule is None).
@@ -284,6 +379,11 @@ def train_and_evaluate_piecelog(
         verbose: Print progress.
         param_stats: Per-parameter z-score stats for normalized param loss.
         conc_scale: Concentration std for normalizing L_conc.
+        lr_schedule: Stepwise decay schedule as list of (epoch, lr) pairs.
+            When provided, overrides CosineAnnealingLR. Use make_stepwise_lr_schedule()
+            to create.
+        n_curve_points: Number of time points for multi-point curve loss.
+            0 (default) keeps the old single-point behavior.
 
     Returns:
         Dict with history and metrics for all splits.
@@ -299,11 +399,14 @@ def train_and_evaluate_piecelog(
         for p in model.param_head.parameters():
             p.requires_grad = False
 
+    initial_lr = get_alpha_for_epoch(0, lr_schedule) if lr_schedule is not None else lr
     optimizer = AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=lr, weight_decay=weight_decay,
+        lr=initial_lr, weight_decay=weight_decay,
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=lr / 10)
+    scheduler = None if lr_schedule is not None else CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=lr / 10,
+    )
     early_stopping = EarlyStopping(patience=patience)
 
     history = {
@@ -325,25 +428,35 @@ def train_and_evaluate_piecelog(
         else:
             current_alpha = alpha
 
+        # Resolve current LR from schedule or leave to cosine scheduler
+        if lr_schedule is not None:
+            current_lr = get_alpha_for_epoch(epoch, lr_schedule)
+            for pg in optimizer.param_groups:
+                pg["lr"] = current_lr
+
         # Unfreeze param_head and rebuild optimizer/scheduler
         if epoch == freeze_epochs and freeze_epochs > 0:
             for p in model.param_head.parameters():
                 p.requires_grad = True
-            optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-            scheduler = CosineAnnealingLR(
-                optimizer, T_max=n_epochs - freeze_epochs, eta_min=lr / 10,
-            )
+            unfreeze_lr = current_lr if lr_schedule is not None else lr
+            optimizer = AdamW(model.parameters(), lr=unfreeze_lr, weight_decay=weight_decay)
+            if lr_schedule is None:
+                scheduler = CosineAnnealingLR(
+                    optimizer, T_max=n_epochs - freeze_epochs, eta_min=lr / 10,
+                )
             if verbose:
                 print(f"Epoch {epoch + 1}: Unfreezing param_head, rebuilding optimizer")
 
         train_metrics = train_epoch_piecelog(
             model, train_loader, optimizer, criterion, device, current_alpha,
             param_stats=param_stats, conc_scale=conc_scale,
+            n_curve_points=n_curve_points,
         )
 
         val_metrics = evaluate_piecelog(
             model, val_loader, criterion, device, current_alpha,
             param_stats=param_stats, conc_scale=conc_scale,
+            n_curve_points=n_curve_points,
         )
 
         history["train_loss"].append(train_metrics["total_loss"])
@@ -352,7 +465,10 @@ def train_and_evaluate_piecelog(
         history["val_loss"].append(val_metrics["loss"])
         history["val_mae"].append(val_metrics["mae"])
         history["val_rmse"].append(val_metrics["rmse"])
-        history["lr"].append(scheduler.get_last_lr()[0])
+        if lr_schedule is not None:
+            history["lr"].append(current_lr)
+        else:
+            history["lr"].append(scheduler.get_last_lr()[0])
         history["alpha"].append(current_alpha)
 
         if verbose and (epoch + 1) % 10 == 0:
@@ -364,7 +480,8 @@ def train_and_evaluate_piecelog(
                 f"Val MAE: {val_metrics['mae']:.3f}"
             )
 
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         if early_stopping(val_metrics["loss"], model):
             if verbose:
@@ -377,9 +494,9 @@ def train_and_evaluate_piecelog(
 
     # Final evaluation uses last active alpha
     final_alpha = current_alpha if alpha_schedule is not None else alpha
-    final_train = evaluate_piecelog(model, train_loader, criterion, device, final_alpha, param_stats=param_stats, conc_scale=conc_scale)
-    final_val = evaluate_piecelog(model, val_loader, criterion, device, final_alpha, param_stats=param_stats, conc_scale=conc_scale)
-    target_metrics = evaluate_piecelog(model, target_loader, criterion, device, final_alpha, param_stats=param_stats, conc_scale=conc_scale)
+    final_train = evaluate_piecelog(model, train_loader, criterion, device, final_alpha, param_stats=param_stats, conc_scale=conc_scale, n_curve_points=n_curve_points)
+    final_val = evaluate_piecelog(model, val_loader, criterion, device, final_alpha, param_stats=param_stats, conc_scale=conc_scale, n_curve_points=n_curve_points)
+    target_metrics = evaluate_piecelog(model, target_loader, criterion, device, final_alpha, param_stats=param_stats, conc_scale=conc_scale, n_curve_points=n_curve_points)
 
     if verbose:
         print("\n=== Final Results (PieceLog-PatchTST) ===")

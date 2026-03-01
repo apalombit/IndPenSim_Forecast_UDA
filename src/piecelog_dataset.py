@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from .data_loader import load_batches
 from .feature_config import INPUT_FEATURES_EXPANDED
@@ -79,6 +79,7 @@ class PieceLogDataset(Dataset):
         augment: bool = False,
         signal_noise_std: float = 0.05,
         param_noise_std: float = 0.05,
+        full_batch: bool = False,
     ):
         """Initialize PieceLog dataset.
 
@@ -101,6 +102,10 @@ class PieceLogDataset(Dataset):
             features: Input feature columns.
             source_ids: Source batch IDs for computing stats.
             conc_column: Concentration column name.
+            full_batch: If True, generate exactly one sample per batch using
+                the full sequence (T_idx = n_steps, D_steps = 0). Useful for
+                decline-model training where t_break / T_max normalization
+                requires the entire batch to be observed.
         """
         self.batch_ids = batch_ids
         self.domain_label = domain_label
@@ -114,6 +119,7 @@ class PieceLogDataset(Dataset):
         self.augment = augment
         self.signal_noise_std = signal_noise_std
         self.param_noise_std = param_noise_std
+        self.full_batch = full_batch
         self.aug_rng = np.random.default_rng() if augment else None
 
         if features is None:
@@ -174,23 +180,31 @@ class PieceLogDataset(Dataset):
 
             dt = (times[1] - times[0]) if len(times) > 1 else 1.0
 
-            for _ in range(self.samples_per_batch):
-                T_frac = self.rng.uniform(self.min_T_fraction, self.max_T_fraction)
-                T_idx = int(T_frac * n_steps)
-                T_idx = max(10, min(T_idx, n_steps - 10))
-
-                D_hours = self.rng.uniform(self.min_D_hours, self.max_D_hours)
-                D_steps = int(D_hours / dt)
-
-                max_D_steps = n_steps - T_idx - 1
-                if D_steps > max_D_steps:
-                    D_steps = max(1, max_D_steps)
-
+            if self.full_batch:
+                # One sample per batch: full sequence, no prediction horizon.
                 self.samples.append({
                     "batch_id": batch_id,
-                    "T_idx": T_idx,
-                    "D_steps": D_steps,
+                    "T_idx": n_steps,
+                    "D_steps": 0,
                 })
+            else:
+                for _ in range(self.samples_per_batch):
+                    T_frac = self.rng.uniform(self.min_T_fraction, self.max_T_fraction)
+                    T_idx = int(T_frac * n_steps)
+                    T_idx = max(10, min(T_idx, n_steps - 10))
+
+                    D_hours = self.rng.uniform(self.min_D_hours, self.max_D_hours)
+                    D_steps = int(D_hours / dt)
+
+                    max_D_steps = n_steps - T_idx - 1
+                    if D_steps > max_D_steps:
+                        D_steps = max(1, max_D_steps)
+
+                    self.samples.append({
+                        "batch_id": batch_id,
+                        "T_idx": T_idx,
+                        "D_steps": D_steps,
+                    })
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -250,9 +264,12 @@ class PieceLogDataset(Dataset):
             ).astype(np.float32)
             X[:, :n_process] += noise
 
+        # Absolute time at end of input window
+        t_cutoff = float(times[T_idx - 1])
+
         # Absolute prediction time
         dt = (times[1] - times[0]) if len(times) > 1 else 1.0
-        t_predict = times[T_idx - 1] + D_steps * dt
+        t_predict = t_cutoff + D_steps * dt
 
         # Fitted parameters for this batch
         params_fitted = self.fitted_params[batch_id].copy()
@@ -288,6 +305,7 @@ class PieceLogDataset(Dataset):
         return {
             "x": torch.tensor(X, dtype=torch.float32),
             "t_predict": torch.tensor(t_predict, dtype=torch.float32),
+            "t_cutoff": torch.tensor(t_cutoff, dtype=torch.float32),
             "y_conc": torch.tensor(y_conc, dtype=torch.float32),
             "params_fitted": torch.tensor(params_fitted, dtype=torch.float32),
             "domain_label": torch.tensor(self.domain_label, dtype=torch.long),
@@ -311,6 +329,7 @@ def piecelog_collate_fn(batch: list[dict]) -> dict:
     return {
         "x": torch.stack([s["x"] for s in batch]),
         "t_predict": torch.stack([s["t_predict"] for s in batch]),
+        "t_cutoff": torch.stack([s["t_cutoff"] for s in batch]),
         "y_conc": torch.stack([s["y_conc"] for s in batch]),
         "params_fitted": torch.stack([s["params_fitted"] for s in batch]),
         "domain_label": torch.stack([s["domain_label"] for s in batch]),
@@ -337,6 +356,9 @@ def create_piecelog_dataloaders(
     augment: bool = False,
     signal_noise_std: float = 0.05,
     param_noise_std: float = 0.05,
+    decline_oversample: float = 1.0,
+    gate_threshold: float = 0.01,
+    full_batch: bool = False,
 ) -> dict:
     """Create train/val/target DataLoaders for PieceLog-PatchTST.
 
@@ -359,6 +381,12 @@ def create_piecelog_dataloaders(
         features: Input feature columns.
         conc_column: Concentration column name.
         num_workers: DataLoader workers.
+        decline_oversample: Weight multiplier for declining batches
+            (slope > gate_threshold) in the training sampler. Values > 1.0
+            oversample declining batches. 1.0 disables oversampling.
+        gate_threshold: Slope threshold for identifying declining batches.
+        full_batch: If True, all datasets use full-batch mode (one sample per
+            batch, T_idx = n_steps, D_steps = 0). See PieceLogDataset.
 
     Returns:
         Dict with 'train', 'val', 'target' DataLoaders, 'stats', and 'max_seq_len'.
@@ -395,6 +423,7 @@ def create_piecelog_dataloaders(
         features=features,
         source_ids=train_ids,
         conc_column=conc_column,
+        full_batch=full_batch,
     )
 
     train_dataset = PieceLogDataset(
@@ -427,10 +456,26 @@ def create_piecelog_dataloaders(
 
     collate = piecelog_collate_fn
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        collate_fn=collate, num_workers=num_workers,
-    )
+    # Oversample declining batches via WeightedRandomSampler
+    if decline_oversample > 1.0:
+        slope_lookup = fitted_params_df.set_index("batch_id")["slope"]
+        weights = []
+        for sample in train_dataset.samples:
+            bid = sample["batch_id"]
+            slope = slope_lookup.get(bid, 0.0)
+            weights.append(decline_oversample if slope > gate_threshold else 1.0)
+        sampler = WeightedRandomSampler(
+            weights, num_samples=len(weights), replacement=True,
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, sampler=sampler,
+            collate_fn=collate, num_workers=num_workers,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            collate_fn=collate, num_workers=num_workers,
+        )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
         collate_fn=collate, num_workers=num_workers,

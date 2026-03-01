@@ -50,7 +50,7 @@ def initialize_param_head(
     raw[2] = _logit(torch.clamp(torch.tensor(means["t0"] / T_max), eps, 1 - eps))
     raw[3] = _softplus_inv(means["lam"])
     raw[4] = _logit(torch.clamp(torch.tensor(means["t_lag"] / (0.3 * T_max)), eps, 1 - eps))
-    raw[5] = _logit(torch.clamp(torch.tensor((means["t_break"] - 0.5 * T_max) / (0.5 * T_max)), eps, 1 - eps))
+    raw[5] = _logit(torch.clamp(torch.tensor(means["t_break"] / T_max), eps, 1 - eps))
     raw[6] = _softplus_inv(means["slope"])
 
     output_layer = model.param_head.mlp[2]
@@ -68,7 +68,7 @@ class ConstrainedParameterHead(nn.Module):
         t0     = sigmoid(.) * T_max          inflection in [0, T_max]
         lam    = softplus(.)                 positive lag rate
         t_lag  = sigmoid(.) * 0.3 * T_max    delay in [0, 30% of batch]
-        t_break= 0.5*T_max + sigmoid(.)*0.5*T_max   in [50%, 100%]
+        t_break= sigmoid(.) * T_max                  in [0, T_max]
         slope  = softplus(.)                 positive decline rate
     """
 
@@ -106,7 +106,7 @@ class ConstrainedParameterHead(nn.Module):
         t0 = torch.sigmoid(raw[:, 2]) * self.T_max
         lam = self.softplus(raw[:, 3])
         t_lag = torch.sigmoid(raw[:, 4]) * 0.3 * self.T_max
-        t_break = 0.5 * self.T_max + torch.sigmoid(raw[:, 5]) * 0.5 * self.T_max
+        t_break = torch.sigmoid(raw[:, 5]) * self.T_max
         slope = self.softplus(raw[:, 6])
 
         return {
